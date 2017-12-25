@@ -3,6 +3,10 @@
 #include "FPSAIGuard.h"
 #include "Perception/PawnSensingComponent.h"
 #include "DrawDebugHelpers.h"
+#include "FPSGameMode.h"
+#include "AI/Navigation/NavigationSystem.h"
+#include "Net/UnrealNetwork.h"
+
 // Sets default values
 AFPSAIGuard::AFPSAIGuard()
 {
@@ -11,14 +15,57 @@ AFPSAIGuard::AFPSAIGuard()
 	PawnSensingComp = CreateDefaultSubobject<UPawnSensingComponent>(TEXT("PawnSensingComp"));
 	PawnSensingComp->OnSeePawn.AddDynamic(this, &AFPSAIGuard::OnPawnSeen);
 	PawnSensingComp->OnHearNoise.AddDynamic(this, &AFPSAIGuard::OnNoiseHeard);
+
+	GuardState = EAIState::Idle;
 }
 
 // Called when the game starts or when spawned
-void AFPSAIGuard::BeginPlay()
-{
+void AFPSAIGuard::BeginPlay(){
+
 	Super::BeginPlay();
 	OriginalRotation = GetActorRotation();
+
+	if (bIsPatrolling) {
+
+		MoveToNextPatrolPoint();
+	}
 	
+}
+
+
+
+// Called every frame
+void AFPSAIGuard::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+
+	if (CurrentPatrolPoint) {
+
+		//FVector Delta = GetActorLocation() - CurrentPatrolPoint->GetActorLocation();
+		float DistanceToGoal = GetDistanceTo(CurrentPatrolPoint);
+		//float DistanceToGoal = Delta.Size();
+
+		//Check if we are within 50 units of our goal, if so - pick a new patrol point
+		if (DistanceToGoal < 50) {
+
+			MoveToNextPatrolPoint();
+		}
+	}
+}
+
+void AFPSAIGuard::MoveToNextPatrolPoint(){
+
+	if (CurrentPatrolPoint == nullptr || CurrentPatrolPoint == SecondPatrolPoint) {
+
+		CurrentPatrolPoint = FirstPatrolPoint;
+	}
+	else {
+
+		CurrentPatrolPoint = SecondPatrolPoint;
+	}
+
+	UNavigationSystem::SimpleMoveToActor(GetController(), CurrentPatrolPoint);
 }
 
 void AFPSAIGuard::OnPawnSeen(APawn* SeenPawn){
@@ -28,11 +75,30 @@ void AFPSAIGuard::OnPawnSeen(APawn* SeenPawn){
 		return;
 	}
 
-
 	DrawDebugSphere(GetWorld(), SeenPawn->GetActorLocation(), 32.0f, 12, FColor::Yellow, false, 10.f);
+
+	AFPSGameMode* GM = Cast<AFPSGameMode>(GetWorld()->GetAuthGameMode());
+	if (GM) {
+
+		GM->CompleteMission(SeenPawn, false);
+	}
+
+	SetGuardState(EAIState::Alerted);
+
+	//Stop movement if patrolling
+	AController* Controller = GetController();
+	if (Controller) {
+
+		Controller->StopMovement();
+	}
+
+
 }
 
 void AFPSAIGuard::OnNoiseHeard(APawn* NoiseInstigator, const FVector& Location, float Volume){
+
+	
+	if (GuardState == EAIState::Alerted) return;
 
 	DrawDebugSphere(GetWorld(), Location, 32.0f, 12, FColor::Red, false, 10.f);
 	
@@ -47,21 +113,57 @@ void AFPSAIGuard::OnNoiseHeard(APawn* NoiseInstigator, const FVector& Location, 
 
 	UWorld* World = GetWorld();
 
-	FTimerManager& TM = World->GetTimerManager();
-	TM.ClearTimer(TimerHandle_ResetOrientation);
+	FTimerManager& TimeManager = World->GetTimerManager();
+	TimeManager.ClearTimer(TimerHandle_ResetOrientation);
 	
-	TM.SetTimer(TimerHandle_ResetOrientation, this, &AFPSAIGuard::ResetOrientation, 3.0f);
+	TimeManager.SetTimer(TimerHandle_ResetOrientation, this, &AFPSAIGuard::ResetOrientation, 3.0f);
+
+	SetGuardState(EAIState::Suspicious);
+
+	//Stop movement if patrolling
+	AController* Controller = GetController();
+	if (Controller) {
+
+		Controller->StopMovement();
+	}
+
 
 }
 
 void AFPSAIGuard::ResetOrientation(){
 
-	SetActorRotation(OriginalRotation);
+	if (GuardState == EAIState::Alerted) return;
+
+	SetActorRotation(OriginalRotation);	
+	SetGuardState(EAIState::Idle);
+
+	if (bIsPatrolling) {
+
+		MoveToNextPatrolPoint();
+	}
 }
 
-// Called every frame
-void AFPSAIGuard::Tick(float DeltaTime)
+void AFPSAIGuard::SetGuardState(EAIState NewState)
 {
-	Super::Tick(DeltaTime);
+	if (GuardState == NewState) {
 
+		return;
+	}
+
+	GuardState = NewState; //Clients automatically gets this variable updated to them when it changes, and OnRep_GuardState is also called for clients.
+	OnRep_GuardState(); //OnRep_GuardState gets called for every client and not the server. So, we need to call this for the server also.
+}
+
+
+//Called on all clients and not the server
+void AFPSAIGuard::OnRep_GuardState() {
+
+	OnStateChange(GuardState);//Notifies Blueprint/UI (WBP_GuardState) that state has changed
+
+}
+
+void AFPSAIGuard::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const {
+
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME(AFPSAIGuard, GuardState);
 }
